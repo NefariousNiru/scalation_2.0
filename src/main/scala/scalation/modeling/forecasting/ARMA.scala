@@ -1,10 +1,11 @@
+
 //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 /** @author  John Miller, Lokesh Adusumilli, Nirupom Bose Roy
- * @version 2.0
- * @date    Sun Jun 30 13:27:00 EDT 2024
- * @see     LICENSE (MIT style license file).
+ *  @version 2.0
+ *  @date    Sun Jun 30 13:27:00 EDT 2024
+ *  @see     LICENSE (MIT style license file).
  *
- * @note    Model: Auto-Regressive, Moving Average (ARMA) via Kalman Filter MLE
+ *  @note    Model: Auto-Regressive, Moving Average (ARMA) via Kalman Filter MLE
  */
 
 package scalation
@@ -17,7 +18,6 @@ import scala.util.boundary
 import scalation.mathstat._
 import scalation.mathstat.MatrixD.outer
 import scalation.optimization.quasi_newton.{LBFGS_B => Optimizer}
-import scalation.modeling.forecasting.Example_Covid.loadData_y
 
 //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 /** The `ARMA` companion object provides factory methods and default
@@ -25,24 +25,23 @@ import scalation.modeling.forecasting.Example_Covid.loadData_y
  */
 object ARMA:
 
-  /** Hyper-parameters:
-   *  - `p`: AR order
-   *  - `q`: MA order
-   */
-  val hp = new HyperParameter
-  hp += ("p", 1, 1)
-  hp += ("q", 1, 1)
+    /** Hyper-parameters:
+     *  - `p`: AR order
+     *  - `q`: MA order
+     */
+    val hp = new HyperParameter
+    hp += ("p", 1, 1)
+    hp += ("q", 1, 1)
 
-  //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-  /** Create an `ARMA` model.
-   *  @param y       the univariate response/time-series vector
-   *  @param hh      the maximum forecast horizon
-   *  @param tRng    the optional time range
-   *  @param hparam  the hyper-parameters
-   */
-  def apply (y: VectorD, hh: Int, tRng: Range = null,
-             hparam: HyperParameter = hp): ARMA =
-    new ARMA (y, hh, tRng, hparam)
+    //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+    /** Create an `ARMA` model.
+     *  @param y       the univariate response/time-series vector
+     *  @param hh      the maximum forecast horizon
+     *  @param tRng    the optional time range
+     *  @param hparam  the hyper-parameters
+     */
+    def apply (y: VectorD, hh: Int, tRng: Range = null, hparam: HyperParameter = hp): ARMA =
+        new ARMA (y, hh, tRng, hparam)
 
 end ARMA
 
@@ -59,13 +58,11 @@ end ARMA
  *  - MA coefficients `θ`
  *  - intercept `c`
  *  - process variance `σ²`
- *
  *  Notes:
  *  - The likelihood is computed from one-step-ahead Kalman innovations.
  *  - A small burn-in (`max(p, q+1)`) is excluded from the log-likelihood
  *    sum to align with the external reference implementation.
  *  - Rolling forecast evaluation is performed externally in the test driver.
- *
  *  @param y        the response/time-series vector
  *  @param hh       the maximum forecast horizon
  *  @param tRng     the optional time range
@@ -73,394 +70,356 @@ end ARMA
  *  @param bakcast  whether a backcast value is prepended
  */
 class ARMA (y: VectorD, hh: Int, tRng: Range = null,
-            hparam: HyperParameter = ARMA.hp,
-            bakcast: Boolean = false)
-  extends Forecaster (y, hh, tRng, hparam, bakcast):
+            hparam: HyperParameter = ARMA.hp, bakcast: Boolean = false)
+      extends Forecaster (y, hh, tRng, hparam, bakcast):
 
-  private val flaw = flawf ("ARMA")
+    private val flaw = flawf ("ARMA")                                  // flaw function
+    private val p    = hparam("p").toInt                               // AR order
+    private val q    = hparam("q").toInt                               // MA order
 
-  /** AR order. */
-  val p = hparam("p").toInt
+    _modelName = s"ARMA($p, $q)"
 
-  /** MA order. */
-  val q = hparam("q").toInt
+    // State dimension for the companion-form state-space model
+    private val r_dim = max (p, q + 1)
 
-  modelName = s"ARMA($p, $q)"
+    // Trained filter used as the rolling forecast state anchor
+    private var kf_tracker: KalmanFilter = null
 
-  /** State dimension for the companion-form state-space model. */
-  private val r_dim = max (p, q + 1)
+    // Stored mean-like quantity implied by the fitted parameterization
+    private var mu_est = 0.0
 
-  /** Trained filter used as the rolling forecast state anchor. */
-  private var kf_tracker: KalmanFilter = null
+    def getBest: BestStep = ???   // FIX -- implement or throw exception
 
-  /** Stored mean-like quantity implied by the fitted parameterization. */
-  private var mu_est = 0.0
+    //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+    /** Train the ARMA model on the supplied response vector using Kalman-filter
+     *  maximum likelihood and a bound-constrained L-BFGS optimizer.
+     *
+     *  Parameter vector layout:  [φ_1 ... φ_p, θ_1 ... θ_q, c, σ²]
+     *
+     *  @param x_null  ignored for univariate models
+     *  @param y_      the training response vector
+     */
+    override def train (x_null: MatrixD, y_ : VectorD): Unit =
+        banner (s"Train $modelName using Kalman Filter MLE")
 
-  //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-  /** Train the ARMA model on the supplied response vector using Kalman-filter
-   *  maximum likelihood and a bound-constrained L-BFGS optimizer.
-   *
-   *  Parameter vector layout:
-   *      [φ_1 ... φ_p, θ_1 ... θ_q, c, σ²]
-   *
-   *  @param x_null  ignored for univariate models
-   *  @param y_      the training response vector
-   */
-  override def train (x_null: MatrixD, y_ : VectorD): Unit =
-    banner (s"Train $modelName using Kalman Filter MLE")
+        // ------------------------------------------------------------------
+        // 1. OLS-based initialization
+        // ------------------------------------------------------------------
 
-    // ------------------------------------------------------------------
-    // 1. OLS-based initialization
-    // ------------------------------------------------------------------
+        val mu_guess    = y_.mean
+        val z_centered  = y_ - mu_guess
+        val n_ols       = z_centered.dim - p
 
-    val mu_guess    = y_.mean
-    val z_centered  = y_ - mu_guess
-    val n_ols       = z_centered.dim - p
+        val X_ols = new MatrixD (n_ols, p)
+        val y_ols = new VectorD (n_ols)
 
-    val X_ols = new MatrixD (n_ols, p)
-    val y_ols = new VectorD (n_ols)
+        for t <- 0 until n_ols do
+            y_ols(t) = z_centered(t + p)
+            for j <- 0 until p do X_ols(t, j) = z_centered(t + p - 1 - j)
+        end for
 
-    for t <- 0 until n_ols do
-      y_ols(t) = z_centered(t + p)
-      for j <- 0 until p do
-        X_ols(t, j) = z_centered(t + p - 1 - j)
-      end for
-    end for
+        val ols = new Regression (X_ols, y_ols)
+        ols.train ()
 
-    val ols = new Regression (X_ols, y_ols)
-    ols.train ()
+        val phi_guesses = ols.parameter
+        val e_ols       = y_ols - ols.predict (X_ols)
+        val sigma2_guess = (e_ols dot e_ols) / n_ols
 
-    val phi_guesses = ols.parameter
-    val e_ols       = y_ols - ols.predict (X_ols)
-    val sigma2_guess = (e_ols dot e_ols) / n_ols
+        // ------------------------------------------------------------------
+        // 2. Negative log-likelihood for Kalman-filter
+        // ------------------------------------------------------------------
 
-    // ------------------------------------------------------------------
-    // 2. Negative log-likelihood for Kalman-filter
-    // ------------------------------------------------------------------
+        def negativeLogLikelihood (b_vec: VectorD): Double = boundary:
+            val (kf, mu_curr) = formKalmanFilter (b_vec)
+            if kf == null then boundary.break (Double.PositiveInfinity)
 
-    def negativeLogLikelihood (b_vec: VectorD): Double = boundary:
-      val (kf, mu_curr) = formKalmanFilter (b_vec)
-      if kf == null then boundary.break (Double.PositiveInfinity)
+            var logLik = 0.0
+            val burn   = max (p, q + 1)
 
-      var logLik = 0.0
-      val burn   = max (p, q + 1)
+            for t <- 0 until y_.dim do
+                kf.predict ()
+                val z     = VectorD (y_(t) - mu_curr)
+                val y_err = z - kf.h * kf.x
+                val s     = kf.h * kf.p * kf.h.transpose + kf.r
+                if s(0, 0) <= 1e-12 then boundary.break (Double.PositiveInfinity)
 
-      for t <- 0 until y_.dim do
-        kf.predict ()
+                val err_sq  = y_err(0) * (1.0 / s(0, 0)) * y_err(0)
+                val contrib = -0.5 * (log (2.0 * Pi) + log (s(0, 0)) + err_sq)
+                if t >= burn then logLik += contrib
+                kf.update (z)
+            end for
 
-        val z     = VectorD (y_(t) - mu_curr)
-        val y_err = z - kf.h * kf.x
-        val s     = kf.h * kf.p * kf.h.transpose + kf.r
+            -logLik
+        end negativeLogLikelihood
 
-        if s(0, 0) <= 1e-12 then
-          boundary.break (Double.PositiveInfinity)
+        // ------------------------------------------------------------------
+        // 3. Initial parameter vector
+        // ------------------------------------------------------------------
 
-        val err_sq  = y_err(0) * (1.0 / s(0, 0)) * y_err(0)
-        val contrib = -0.5 * (log (2.0 * Pi) + log (s(0, 0)) + err_sq)
+        val num_params = p + q + 2
+        val b0         = new VectorD (num_params)
+        val offset     = if phi_guesses.dim > p then 1 else 0
 
-        if t >= burn then logLik += contrib
-        kf.update (z)
-      end for
+        for i <- 0 until p do b0(i) = phi_guesses(i + offset)
+        for i <- 0 until q do b0(p + i) = 0.0
 
-      -logLik
-    end negativeLogLikelihood
+        val phi_init_sum = (0 until p).map (i => b0(i)).sum
+        val c_guess      = mu_guess * (1.0 - phi_init_sum)
 
-    // ------------------------------------------------------------------
-    // 3. Initial parameter vector
-    // ------------------------------------------------------------------
+        b0(p + q)     = c_guess
+        b0(p + q + 1) = sigma2_guess
 
-    val num_params = p + q + 2
-    val b0         = new VectorD (num_params)
-    val offset     = if phi_guesses.dim > p then 1 else 0
+        // ------------------------------------------------------------------
+        // 4. Bound-constrained optimization
+        // ------------------------------------------------------------------
 
-    for i <- 0 until p do
-      b0(i) = phi_guesses(i + offset)
-    end for
+        val lowerBounds = VectorD.fill (p + q)(-2.0) ++ VectorD (-100000.0, 1e-6)
+        val upperBounds = VectorD.fill (p + q)( 2.0) ++ VectorD ( 100000.0, Double.PositiveInfinity)
 
-    for i <- 0 until q do
-      b0(p + i) = 0.0
-    end for
+        val optimizer = new Optimizer (f = negativeLogLikelihood, l_u = (lowerBounds, upperBounds))
+        val (est_loss, est_params) = optimizer.solve (b0)
 
-    val phi_init_sum = (0 until p).map (i => b0(i)).sum
-    val c_guess      = mu_guess * (1.0 - phi_init_sum)
+        // ------------------------------------------------------------------
+        // 5. Persist fitted parameters and construct the tracker filter
+        // ------------------------------------------------------------------
 
-    b0(p + q)     = c_guess
-    b0(p + q + 1) = sigma2_guess
+        b = est_params
 
-    // ------------------------------------------------------------------
-    // 4. Bound-constrained optimization
-    // ------------------------------------------------------------------
+        val (final_kf, final_mu) = formKalmanFilter (b)
+        kf_tracker = final_kf
+        mu_est     = final_mu
 
-    val lowerBounds = VectorD.fill (p + q)(-2.0) ++ VectorD (-100000.0, 1e-6)
-    val upperBounds = VectorD.fill (p + q)( 2.0) ++ VectorD ( 100000.0, Double.PositiveInfinity)
+        for t <- 0 until y_.dim do
+            kf_tracker.predict ()
+            kf_tracker.update (VectorD (y_(t) - mu_est))
+        end for
 
-    val optimizer = new Optimizer (f = negativeLogLikelihood, l_u = (lowerBounds, upperBounds))
-    val (est_loss, est_params) = optimizer.solve (b0)
+        val phisEst = est_params(0 until p)
+        val cEst    = est_params(p + q)
+        val phiSum  = phisEst.sum
+        val muImp   = if math.abs (1.0 - phiSum) > 1e-8 then cEst / (1.0 - phiSum) else Double.NaN
 
-    // ------------------------------------------------------------------
-    // 5. Persist fitted parameters and construct the tracker filter
-    // ------------------------------------------------------------------
+        println (s"\nEstimated params for ARMA($p,$q)")
+        println (s"phis        = $phisEst")
+        if q > 0 then println (s"thetas      = ${est_params(p until p + q)}")
+        println (s"intercept c = $cEst")
+        println (s"implied mu  = $muImp")
+        println (s"sigma2      = ${est_params(p + q + 1)}")
+        println (s"negLogLik   = $est_loss")
+    end train
 
-    b = est_params
+    //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+    /** Construct a Kalman filter from the parameter vector.
+     *
+     *  Parameter vector layout:  [φ_1 ... φ_p, θ_1 ... θ_q, c, σ²]
+     *
+     *  @param b_vec  the parameter vector
+     *  @return       `(KalmanFilter, mu)` or `(null, 0.0)` if invalid
+     */
+    private def formKalmanFilter (b_vec: VectorD): (KalmanFilter, Double) =
+        val phis   = b_vec(0 until p)
+        val thetas = b_vec(p until p + q)
+        val c      = b_vec(p + q)
 
-    val (final_kf, final_mu) = formKalmanFilter (b)
-    kf_tracker = final_kf
-    mu_est     = final_mu
+        val phi_sum = phis.sum
+        val denom   = 1.0 - phi_sum
+        if math.abs (denom) <= 1e-8 then return (null, 0.0)
 
-    for t <- 0 until y_.dim do
-      kf_tracker.predict ()
-      kf_tracker.update (VectorD (y_(t) - mu_est))
-    end for
+        val mu = c / denom
 
-    val phisEst = est_params(0 until p)
-    val cEst    = est_params(p + q)
-    val phiSum  = phisEst.sum
-    val muImp   = if math.abs (1.0 - phiSum) > 1e-8 then cEst / (1.0 - phiSum) else Double.NaN
+        val sig2_proc = b_vec(p + q + 1)
+        val sig2_obs  = 1e-6
 
-    println (s"\nEstimated params for ARMA($p,$q)")
-    println (s"phis        = $phisEst")
-    if q > 0 then println (s"thetas      = ${est_params(p until p + q)}")
-    println (s"intercept c = $cEst")
-    println (s"implied mu  = $muImp")
-    println (s"sigma2      = ${est_params(p + q + 1)}")
-    println (s"negLogLik   = $est_loss")
-  end train
+        if sig2_proc <= 0.0 then return (null, 0.0)
 
-  //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-  /** Construct a Kalman filter from the parameter vector.
-   *
-   *  Parameter vector layout:
-   *      [φ_1 ... φ_p, θ_1 ... θ_q, c, σ²]
-   *
-   *  @param b_vec  the parameter vector
-   *  @return       `(KalmanFilter, mu)` or `(null, 0.0)` if invalid
-   */
-  private def formKalmanFilter (b_vec: VectorD): (KalmanFilter, Double) =
-    val phis   = b_vec(0 until p)
-    val thetas = b_vec(p until p + q)
-    val c      = b_vec(p + q)
+        // Companion-form state transition matrix.
+        val f = new MatrixD (r_dim, r_dim)
+        for j <- 0 until p do f(0, j) = phis(j)
+        for i <- 1 until r_dim do f(i, i - 1) = 1.0
 
-    val phi_sum = phis.sum
-    val denom   = 1.0 - phi_sum
-    if math.abs (denom) <= 1e-8 then return (null, 0.0)
+        // Process noise covariance Q = G G' σ².
+        val g = new VectorD (r_dim)
+        g(0)  = 1.0
+        for i <- 0 until q if i + 1 < r_dim do g(i + 1) = thetas(i)
+        val q_mat = outer (g, g) * sig2_proc
 
-    val mu = c / denom
+        // Observation model: observe the first state element.
+        val h_mat = new MatrixD (1, r_dim)
+        h_mat(0, 0) = 1.0
 
-    val sig2_proc = b_vec(p + q + 1)
-    val sig2_obs  = 1e-6
+        val r_mat = MatrixD ((1, 1), sig2_obs)
 
-    if sig2_proc <= 0.0 then return (null, 0.0)
+        // Diffuse-style large-variance initialization.
+        val x0 = new VectorD (r_dim)
+        val p0 = MatrixD.eye (r_dim, r_dim) * 1e6
 
-    // Companion-form state transition matrix.
-    val f = new MatrixD (r_dim, r_dim)
-    for j <- 0 until p do
-      f(0, j) = phis(j)
-    end for
-    for i <- 1 until r_dim do
-      f(i, i - 1) = 1.0
-    end for
+        (new KalmanFilter (f, q_mat, h_mat, r_mat, x0, p0), mu)
+    end formKalmanFilter
 
-    // Process noise covariance Q = G G' σ².
-    val g = new VectorD (r_dim)
-    g(0) = 1.0
-    for i <- 0 until q if i + 1 < r_dim do
-      g(i + 1) = thetas(i)
-    end for
-    val q_mat = outer (g, g) * sig2_proc
+    //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+    /** Return a copy of the trained filter and the associated mean quantity.
+     *  Useful for rolling-origin forecast evaluation without mutating the
+     *  stored tracker state.
+     */
+    def getTrainedFilter: (KalmanFilter, Double) =
+        if kf_tracker == null then
+            flaw ("getTrainedFilter", "model has not been trained")
+            (null, mu_est)
+        else
+            (kf_tracker.copyFilter (), mu_est)
+    end getTrainedFilter
 
-    // Observation model: observe the first state element.
-    val h_mat = new MatrixD (1, r_dim)
-    h_mat(0, 0) = 1.0
+    //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+    /** Forecast all time points for a given horizon `h` using the stored
+     *  tracker state.
+     *  @param h   the forecast horizon
+     *  @param y_  the observed series
+     */
+    override def forecastAt (h: Int, y_ : VectorD = yb): VectorD =
+        if kf_tracker == null then flaw ("forecastAt", "model has not been trained")
+        val (temp_kf, mu) = getTrainedFilter
 
-    val r_mat = MatrixD ((1, 1), sig2_obs)
+        for t <- 0 until y_.dim do
+            val kf_forc = new KalmanFilter (temp_kf.f, temp_kf.q, temp_kf.h, temp_kf.r,
+                                            temp_kf.x.copy, temp_kf.p.copy)
+            for step <- 0 until h do
+                kf_forc.predict ()
+                if step == h - 1 then
+                    val pred = (kf_forc.h * kf_forc.x)(0) + mu
+                    yf(t, h) = pred
+            end for
 
-    // Diffuse-style large-variance initialization.
-    val x0 = new VectorD (r_dim)
-    val p0 = MatrixD.eye (r_dim, r_dim) * 1e6
+            temp_kf.predict ()
+            temp_kf.update (VectorD (y_(t) - mu))
+        end for
 
-    (new KalmanFilter (f, q_mat, h_mat, r_mat, x0, p0), mu)
-  end formKalmanFilter
+        yf(?, h)
+    end forecastAt
 
-  //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-  /** Return a copy of the trained filter and the associated mean quantity.
-   *  Useful for rolling-origin forecast evaluation without mutating the
-   *  stored tracker state.
-   */
-  def getTrainedFilter: (KalmanFilter, Double) =
-    if kf_tracker == null then
-      flaw ("getTrainedFilter", "model has not been trained")
-      (null, mu_est)
-    else
-      (kf_tracker.copyFilter (), mu_est)
-  end getTrainedFilter
-
-  //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-  /** Forecast all time points for a given horizon `h` using the stored
-   *  tracker state.
-   *
-   *  @param h   the forecast horizon
-   *  @param y_  the observed series
-   */
-  override def forecastAt (h: Int, y_ : VectorD = yb): VectorD =
-    if kf_tracker == null then flaw ("forecastAt", "model has not been trained")
-
-    val (temp_kf, mu) = getTrainedFilter
-
-    for t <- 0 until y_.dim do
-      val kf_forc = new KalmanFilter (
-        temp_kf.f, temp_kf.q, temp_kf.h, temp_kf.r,
-        temp_kf.x.copy, temp_kf.p.copy
-      )
-
-      for step <- 0 until h do
-        kf_forc.predict ()
-        if step == h - 1 then
-          val pred = (kf_forc.h * kf_forc.x)(0) + mu
-          yf(t, h) = pred
-        end if
-      end for
-
-      temp_kf.predict ()
-      temp_kf.update (VectorD (y_(t) - mu))
-    end for
-
-    yf(?, h)
-  end forecastAt
-
-  //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-  /** One-step prediction placeholder required by `Forecaster`.
-   *  Horizon-specific forecasting is handled by `forecastAt`.
-   */
-  override def predict (t: Int, y_ : VectorD): Double = 0.0
+    //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+    /** One-step prediction placeholder required by `Forecaster`.
+     *  Horizon-specific forecasting is handled by `forecastAt`.
+     *  @param t   the given time
+     *  @param y_  the actual time series
+     */
+    override def predict (t: Int, y_ : VectorD): Double = 0.0
 
 end ARMA
 
+import Example_Covid.loadData_y
 
 //::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 /** Rolling-origin validation driver for the standalone Kalman-filter ARMA
  *  implementation.
- *
  *  The logic mirrors the external Python validation flow:
  *  - fit once on the training window
  *  - forecast horizons `1..hh` before each newly revealed test observation
  *  - update the filter state sequentially without refitting
- *
  *  > runMain scalation.modeling.forecasting.aRMA_KalmanRollingValidation
  */
 @main def aRMA_KalmanRollingValidation (): Unit =
 
-  // --------------------------------------------------------------------------
-  // Configuration
-  // --------------------------------------------------------------------------
-  val p_max      = 5          // maximum AR order to evaluate
-  val q_max      = 0          // maximum MA order to evaluate
-  val hh         = 6          // maximum forecast horizon
-  val train_size = 92         // length of training window
+    // --------------------------------------------------------------------------
+    // Configuration
+    // --------------------------------------------------------------------------
+    val p_max      = 5          // maximum AR order to evaluate
+    val q_max      = 0          // maximum MA order to evaluate
+    val hh         = 6          // maximum forecast horizon
+    val train_size = 92         // length of training window
 
-  // --------------------------------------------------------------------------
-  // Load and split data
-  // --------------------------------------------------------------------------
-  val yy      = loadData_y ()
-  val y       = yy(0 until 116)
-  val y_train = y(0 until train_size)
+    // --------------------------------------------------------------------------
+    // Load and split data
+    // --------------------------------------------------------------------------
+    val yy      = loadData_y ()
+    val y       = yy(0 until 116)
+    val y_train = y(0 until train_size)
 
-  println (s"Data Split: Total=${y.dim}, Train=$train_size, Test=${y.dim - train_size}")
+    println (s"Data Split: Total=${y.dim}, Train=$train_size, Test=${y.dim - train_size}")
 
-  // --------------------------------------------------------------------------
-  // Evaluate all requested (p, q) configurations
-  // --------------------------------------------------------------------------
-  for p <- 5 to p_max do
-    for q <- 0 to q_max do
+    // --------------------------------------------------------------------------
+    // Evaluate all requested (p, q) configurations
+    // --------------------------------------------------------------------------
+    for p <- 5 to p_max; q <- 0 to q_max do
 
-      // ----------------------------------------------------------------------
-      // 1. Fit model on training data only
-      // ----------------------------------------------------------------------
-      ARMA.hp("p") = p
-      ARMA.hp("q") = q
+        // ----------------------------------------------------------------------
+        // 1. Fit model on training data only
+        // ----------------------------------------------------------------------
+        ARMA.hp("p") = p
+        ARMA.hp("q") = q
 
-      val model = new ARMA (y, hh)
-      model.train (null, y_train)
+        val model = new ARMA (y, hh)
+        model.train (null, y_train)
 
-      // ----------------------------------------------------------------------
-      // 2. Rolling-origin forecast generation
-      //
-      // At each origin t:
-      //   - forecast horizons 1..hh before revealing y(t)
-      //   - store each horizon-h forecast at the row corresponding to its
-      //     target time
-      //   - update the rolling filter with the newly observed value y(t)
-      // ----------------------------------------------------------------------
-      val (kfRolling, muFinal) = model.getTrainedFilter
-      val yfMatrix             = new MatrixD (y.dim, hh)
+        // ----------------------------------------------------------------------
+        // 2. Rolling-origin forecast generation
+        //
+        // At each origin t:
+        //   - forecast horizons 1..hh before revealing y(t)
+        //   - store each horizon-h forecast at the row corresponding to its
+        //     target time
+        //   - update the rolling filter with the newly observed value y(t)
+        // ----------------------------------------------------------------------
+        val (kfRolling, muFinal) = model.getTrainedFilter
+        val yfMatrix             = new MatrixD (y.dim, hh)
 
-      for t <- train_size until y.dim do
-        // Clone the current rolling state so forecasting does not mutate it.
-        val kfForecast = new KalmanFilter (
-          kfRolling.f,
-          kfRolling.q,
-          kfRolling.h,
-          kfRolling.r,
-          kfRolling.x.copy,
-          kfRolling.p.copy
-        )
+        for t <- train_size until y.dim do
+            // Clone the current rolling state so forecasting does not mutate it.
+            val kfForecast = new KalmanFilter (kfRolling.f, kfRolling.q,
+                                               kfRolling.h, kfRolling.r,
+                                               kfRolling.x.copy, kfRolling.p.copy)
 
-        // Generate forecasts for horizons 1..hh from the current origin.
+            // Generate forecasts for horizons 1..hh from the current origin.
+            for h <- 0 until hh do
+                kfForecast.predict ()
+                val yHat = (kfForecast.h * kfForecast.x)(0) + muFinal
+
+                val targetTime = t + h
+                if targetTime < y.dim then yfMatrix(targetTime, h) = yHat
+            end for
+
+            // Reveal the next actual observation and update the rolling state.
+            kfRolling.predict ()
+            kfRolling.update (VectorD (y(t) - muFinal))
+        end for
+
+        // ----------------------------------------------------------------------
+        // 3. Horizon-wise evaluation
+        //
+        // Alignment:
+        //   Column h stores forecasts for horizon (h + 1), and the earliest valid
+        //   row for that column is train_size + h.
+        // ----------------------------------------------------------------------
+        class RollingDiagnoser (dfm: Double, df: Double) extends Diagnoser (dfm, df):
+            val modName = s"Rolling-ARMA($p, $q)"
+        end RollingDiagnoser
+
         for h <- 0 until hh do
-          kfForecast.predict ()
-          val yHat = (kfForecast.h * kfForecast.x)(0) + muFinal
+            val hStep     = h + 1
+            val evalStart = train_size + h
+            val evalEnd   = y.dim
 
-          val targetTime = t + h
-          if targetTime < y.dim then
-            yfMatrix(targetTime, h) = yHat
-          end if
+            val yActual = y(evalStart until evalEnd)
+            val yPred   = yfMatrix(evalStart until evalEnd, h)
+
+            println (s"\n--- Test Set Metrics (Horizon h=$hStep) ---")
+
+            val dfm = (p + q + 1).toDouble
+            val df  = yActual.dim - dfm
+
+            val diagnoser = new RollingDiagnoser (dfm, df)
+            diagnoser.setSkip (0)
+
+            val stats = diagnoser.diagnose (yActual, yPred)
+
+            for i <- stats.indices do
+                if qoF_names(i) != "NA" then println (f"${qoF_names(i)}%10s = ${stats(i)}%12.6f")
+
+            val tAxis    = VectorD.range (0, y.dim)
+            val plotPred = yfMatrix(?, h).copy
+            new Plot (tAxis, y, plotPred, s"Rolling Forecast ARMA($p,$q) h=$hStep", lines = true)
         end for
-
-        // Reveal the next actual observation and update the rolling state.
-        kfRolling.predict ()
-        kfRolling.update (VectorD (y(t) - muFinal))
-      end for
-
-      // ----------------------------------------------------------------------
-      // 3. Horizon-wise evaluation
-      //
-      // Alignment:
-      //   Column h stores forecasts for horizon (h + 1), and the earliest valid
-      //   row for that column is train_size + h.
-      // ----------------------------------------------------------------------
-      class RollingDiagnoser (dfm: Double, df: Double) extends Diagnoser (dfm, df):
-        val modName = s"Rolling-ARMA($p, $q)"
-      end RollingDiagnoser
-
-      for h <- 0 until hh do
-        val hStep     = h + 1
-        val evalStart = train_size + h
-        val evalEnd   = y.dim
-
-        val yActual = y(evalStart until evalEnd)
-        val yPred   = yfMatrix(evalStart until evalEnd, h)
-
-        println (s"\n--- Test Set Metrics (Horizon h=$hStep) ---")
-
-        val dfm = (p + q + 1).toDouble
-        val df  = yActual.dim - dfm
-
-        val diagnoser = new RollingDiagnoser (dfm, df)
-        diagnoser.setSkip (0)
-
-        val stats = diagnoser.diagnose (yActual, yPred)
-
-        for i <- stats.indices do
-          if qoF_names(i) != "NA" then
-            println (f"${qoF_names(i)}%10s = ${stats(i)}%12.6f")
-          end if
-        end for
-
-        val tAxis    = VectorD.range (0, y.dim)
-        val plotPred = yfMatrix(?, h).copy
-        new Plot (tAxis, y, plotPred, s"Rolling Forecast ARMA($p,$q) h=$hStep", lines = true)
-      end for
 
     end for
-  end for
 
 end aRMA_KalmanRollingValidation
+
