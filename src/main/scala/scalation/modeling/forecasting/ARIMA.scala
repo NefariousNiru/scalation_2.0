@@ -136,8 +136,8 @@ end ARIMA
     mod.trainNtest ()()      
 
     banner ("Select model based on ACF and PACF")
-    mod.plotFunc (mod.acF, "ACF")                                      // Auto-Correlation Function (ACF)
-    mod.plotFunc (mod.pacF, "PACF")                                    // Partial Auto-Correlation Function (PACF)
+//    mod.plotFunc (mod.acF, "ACF")                                      // Auto-Correlation Function (ACF)
+//    mod.plotFunc (mod.pacF, "PACF")                                    // Partial Auto-Correlation Function (PACF)
 
 end aRIMATest
 
